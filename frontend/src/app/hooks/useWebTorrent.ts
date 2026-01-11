@@ -1,196 +1,184 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
-// WebTorrent types
 interface TorrentFile {
+    index: number;
     name: string;
-    length: number;
     path: string;
+    size: number;
+    sizeFormatted: string;
+    isVideo?: boolean;
 }
 
-interface Torrent {
-    infoHash: string;
-    name: string;
-    files: TorrentFile[];
-    progress: number;
-    downloadSpeed: number;
-    uploadSpeed: number;
-    numPeers: number;
-    done: boolean;
-    destroy: () => void;
-    on: (event: string, callback: (...args: any[]) => void) => void;
-}
-
-interface WebTorrentClient {
-    add: (magnetUri: string, opts?: any, callback?: (torrent: Torrent) => void) => Torrent;
-    destroy: () => void;
-    torrents: Torrent[];
-}
-
-declare global {
-    interface Window {
-        WebTorrent: new () => WebTorrentClient;
-    }
-}
-
-interface UseWebTorrentOptions {
-    autoPlay?: boolean;
-}
-
-interface WebTorrentState {
+interface TorrentState {
     isLoading: boolean;
     isReady: boolean;
     error: string | null;
-    progress: number; // 0-100
-    downloadSpeed: number; // bytes/s
-    uploadSpeed: number; // bytes/s
-    peers: number;
-    torrentName: string | null;
+    files: TorrentFile[];
+    selectedFile: TorrentFile | null;
     videoUrl: string | null;
+    infoHash: string | null;
+    downloadSpeed: number;
+    peers: number;
 }
 
-/**
- * Hook to stream video from magnet links using WebTorrent
- */
-export function useWebTorrent(magnetUri: string | null, options: UseWebTorrentOptions = {}) {
-    const { autoPlay = true } = options;
-    const clientRef = useRef<WebTorrentClient | null>(null);
-    const videoRef = useRef<HTMLVideoElement | null>(null);
+const API_URL = 'http://localhost:3001';
 
-    const [state, setState] = useState<WebTorrentState>({
+/**
+ * Hook to manage torrent streaming with native Node.js backend
+ * Flow: Add magnet → Get files → Stream with transcoding
+ */
+export function useWebTorrent(magnetUri: string | null) {
+    const [state, setState] = useState<TorrentState>({
         isLoading: false,
         isReady: false,
         error: null,
-        progress: 0,
-        downloadSpeed: 0,
-        uploadSpeed: 0,
-        peers: 0,
-        torrentName: null,
+        files: [],
+        selectedFile: null,
         videoUrl: null,
+        infoHash: null,
+        downloadSpeed: 0,
+        peers: 0
     });
 
-    // Load WebTorrent script
+    const statusInterval = useRef<NodeJS.Timeout | null>(null);
+
+    // Add torrent and get file list
     useEffect(() => {
-        if (typeof window !== 'undefined' && !window.WebTorrent) {
-            const script = document.createElement('script');
-            script.src = 'https://cdn.jsdelivr.net/npm/webtorrent@latest/webtorrent.min.js';
-            script.async = true;
-            document.body.appendChild(script);
+        if (!magnetUri) {
+            setState(s => ({ ...s, videoUrl: null, isReady: false, files: [], infoHash: null }));
+            return;
         }
-    }, []);
 
-    // Start torrent when magnet changes
-    useEffect(() => {
-        if (!magnetUri) return;
-
-        const startTorrent = async () => {
-            // Wait for WebTorrent to load
-            let attempts = 0;
-            while (!window.WebTorrent && attempts < 50) {
-                await new Promise(r => setTimeout(r, 100));
-                attempts++;
-            }
-
-            if (!window.WebTorrent) {
-                setState(s => ({ ...s, error: 'WebTorrent failed to load' }));
-                return;
-            }
-
-            // Cleanup previous client
-            if (clientRef.current) {
-                clientRef.current.destroy();
-            }
-
-            setState(s => ({ ...s, isLoading: true, error: null, progress: 0 }));
+        const addTorrent = async () => {
+            setState(s => ({ ...s, isLoading: true, error: null }));
 
             try {
-                const client = new window.WebTorrent();
-                clientRef.current = client;
+                console.log('[Torrent] Adding magnet...');
 
-                const torrent = client.add(magnetUri, {
-                    announce: [
-                        'wss://tracker.openwebtorrent.com',
-                        'wss://tracker.btorrent.xyz',
-                        'wss://tracker.fastcast.nz'
-                    ]
+                const response = await fetch(`${API_URL}/api/stream/add`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ magnet: magnetUri })
                 });
 
-                torrent.on('ready', () => {
-                    console.log('Torrent ready:', torrent.name);
+                if (!response.ok) {
+                    const data = await response.json();
+                    throw new Error(data.error || 'Failed to add torrent');
+                }
 
-                    // Find video file
-                    const videoFile = torrent.files.find((file: TorrentFile) =>
-                        /\.(mp4|mkv|avi|webm|mov)$/i.test(file.name)
-                    );
+                const data = await response.json();
+                console.log('[Torrent] Added:', data);
 
-                    if (!videoFile) {
-                        setState(s => ({ ...s, isLoading: false, error: 'No video file found in torrent' }));
-                        return;
-                    }
+                if (!data.files || data.files.length === 0) {
+                    throw new Error('No video files found in torrent');
+                }
 
-                    // Create blob URL for video
-                    (videoFile as any).getBlobURL((err: Error | null, url: string) => {
-                        if (err) {
-                            setState(s => ({ ...s, isLoading: false, error: err.message }));
-                            return;
-                        }
+                // Find largest video file
+                const videoFiles = data.files.filter((f: TorrentFile) =>
+                    f.isVideo || /\.(mkv|mp4|avi|webm)$/i.test(f.name)
+                );
 
-                        setState(s => ({
-                            ...s,
-                            isLoading: false,
-                            isReady: true,
-                            torrentName: torrent.name,
-                            videoUrl: url,
-                        }));
-                    });
-                });
+                if (videoFiles.length === 0) {
+                    throw new Error('No video files found in torrent');
+                }
 
-                // Progress updates
-                const updateProgress = () => {
-                    setState(s => ({
-                        ...s,
-                        progress: Math.round(torrent.progress * 100),
-                        downloadSpeed: torrent.downloadSpeed,
-                        uploadSpeed: torrent.uploadSpeed,
-                        peers: torrent.numPeers,
-                    }));
-                };
+                // Select the largest video file
+                const selectedFile = videoFiles.reduce((a: TorrentFile, b: TorrentFile) =>
+                    a.size > b.size ? a : b
+                );
 
-                torrent.on('download', updateProgress);
-                torrent.on('upload', updateProgress);
+                // Construct stream URL with transcoding
+                const streamUrl = `${API_URL}/api/stream/${data.infoHash}/${selectedFile.index}?transcode=true`;
 
-                torrent.on('error', (err: Error) => {
-                    console.error('Torrent error:', err);
-                    setState(s => ({ ...s, isLoading: false, error: err.message }));
-                });
+                console.log('[Torrent] Stream URL:', streamUrl);
 
-            } catch (err: any) {
-                console.error('WebTorrent error:', err);
-                setState(s => ({ ...s, isLoading: false, error: err.message }));
+                setState(s => ({
+                    ...s,
+                    isLoading: false,
+                    isReady: true,
+                    files: data.files,
+                    selectedFile,
+                    videoUrl: streamUrl,
+                    infoHash: data.infoHash
+                }));
+
+                // Start polling for status
+                startStatusPolling(data.infoHash);
+
+            } catch (err) {
+                console.error('[Torrent] Error:', err);
+                setState(s => ({
+                    ...s,
+                    isLoading: false,
+                    isReady: false,
+                    error: err instanceof Error ? err.message : 'Failed to add torrent'
+                }));
             }
         };
 
-        startTorrent();
+        addTorrent();
 
         return () => {
-            if (clientRef.current) {
-                clientRef.current.destroy();
-                clientRef.current = null;
+            if (statusInterval.current) {
+                clearInterval(statusInterval.current);
             }
         };
     }, [magnetUri]);
 
-    // Format speed
-    const formatSpeed = useCallback((bytesPerSec: number): string => {
-        if (bytesPerSec < 1024) return `${bytesPerSec.toFixed(0)} B/s`;
-        if (bytesPerSec < 1024 * 1024) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
-        return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
-    }, []);
+    // Poll for download status
+    const startStatusPolling = (infoHash: string) => {
+        if (statusInterval.current) {
+            clearInterval(statusInterval.current);
+        }
+
+        statusInterval.current = setInterval(async () => {
+            try {
+                const response = await fetch(`${API_URL}/api/stream/status/${infoHash}`);
+                if (response.ok) {
+                    const data = await response.json();
+                    setState(s => ({
+                        ...s,
+                        downloadSpeed: data.downloadSpeed || 0,
+                        peers: data.peers || 0
+                    }));
+                }
+            } catch (e) {
+                // Ignore polling errors
+            }
+        }, 2000);
+    };
+
+    // Select a different file
+    const selectFile = useCallback((file: TorrentFile) => {
+        if (!state.infoHash) return;
+
+        const streamUrl = `${API_URL}/api/stream/${state.infoHash}/${file.index}?transcode=true`;
+        setState(s => ({
+            ...s,
+            selectedFile: file,
+            videoUrl: streamUrl
+        }));
+    }, [state.infoHash]);
+
+    // Format download speed
+    const downloadSpeedFormatted = state.downloadSpeed > 0
+        ? `${(state.downloadSpeed / 1024 / 1024).toFixed(2)} MB/s`
+        : '0 MB/s';
 
     return {
-        ...state,
-        videoRef,
-        formatSpeed,
-        downloadSpeedFormatted: formatSpeed(state.downloadSpeed),
-        uploadSpeedFormatted: formatSpeed(state.uploadSpeed),
+        isLoading: state.isLoading,
+        isReady: state.isReady,
+        error: state.error,
+        files: state.files,
+        selectedFile: state.selectedFile,
+        videoUrl: state.videoUrl,
+        torrentName: state.selectedFile?.name || '',
+        downloadSpeed: state.downloadSpeed,
+        downloadSpeedFormatted,
+        peers: state.peers,
+        selectFile
     };
 }
+
+// Keep for backward compatibility
+export const useVideoSource = useWebTorrent;
